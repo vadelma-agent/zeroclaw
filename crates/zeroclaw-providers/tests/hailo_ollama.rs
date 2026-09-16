@@ -1564,16 +1564,16 @@ async fn native_hailo_bounds_history_and_preserves_latest_user_tail() {
     });
 
     let mut history = vec![
-        ChatMessage::system(format!("{}\nSYSTEM_TAIL", "s".repeat(3_000))),
+        ChatMessage::system(format!("{}\nSYSTEM_TAIL", "s".repeat(900))),
         ChatMessage::assistant("orphan assistant"),
     ];
     for index in 0..8 {
-        history.push(ChatMessage::user(format!("u{index}")));
-        history.push(ChatMessage::assistant(format!("a{index}")));
+        history.push(ChatMessage::user(format!("u{index}{}", "u".repeat(400))));
+        history.push(ChatMessage::assistant(format!("a{index}{}", "a".repeat(400))));
     }
     history.push(ChatMessage::user(format!(
         "LATEST_HEAD{}LATEST_TAIL",
-        "x".repeat(3_000)
+        "x".repeat(1_500)
     )));
 
     let provider = HailoOllamaModelProvider::new(
@@ -1582,7 +1582,7 @@ async fn native_hailo_bounds_history_and_preserves_latest_user_tail() {
         5,
         5,
         OllamaTuning {
-            num_ctx: 2048,
+            num_ctx: 800,
             num_predict: 64,
             ..Default::default()
         },
@@ -1599,7 +1599,7 @@ async fn native_hailo_bounds_history_and_preserves_latest_user_tail() {
         .clone()
         .expect("request captured");
     let messages = body["messages"].as_array().expect("messages array");
-    assert_eq!(messages.len(), 17);
+    assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["role"], "user");
     assert!(
         messages[0]["content"]
@@ -1607,12 +1607,10 @@ async fn native_hailo_bounds_history_and_preserves_latest_user_tail() {
             .expect("first content")
             .starts_with("Instructions: ")
     );
-    assert!(
-        messages[0]["content"]
-            .as_str()
-            .expect("first content")
-            .contains("Request: u0")
-    );
+    assert!(!messages[0]["content"]
+        .as_str()
+        .expect("first content")
+        .contains("Request: u0"));
     assert_eq!(messages.last().expect("latest message")["role"], "user");
     assert!(
         messages.last().expect("latest message")["content"]
@@ -1650,7 +1648,7 @@ async fn native_hailo_bounds_history_and_preserves_latest_user_tail() {
 }
 
 #[tokio::test]
-async fn native_hailo_fold_reallocates_unused_system_budget_to_user() {
+async fn native_hailo_fold_preserves_complete_system_and_user_content() {
     let capture: Capture = Arc::new(Mutex::new(None));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

@@ -237,11 +237,13 @@ Responses must be a completed non-streaming response
 (`done=true`), and an empty completed response is treated as an error. A low
 `context_window` drops complete older user-anchored turns using the configured
 best-effort aggregate budget. System instructions are folded into the first
-retained user message before that check. If the newest complete turn alone then
-exceeds the configured budget, the request fails locally before transport
-instead of dropping that turn or substituting a synthetic prompt. There is no
-provider-wide character or message-count cap; the native HEF/runtime remains
-the authority for the actual supported context capacity.
+retained user message before that check. When a nonzero `context_window` is
+configured, if the newest complete turn alone then exceeds the configured
+budget, the request fails locally before transport instead of dropping that
+turn or substituting a synthetic prompt. With `context_window = 0`, no
+provider-wide local budget is applied. There is no provider-wide character or
+message-count cap; the native HEF/runtime remains the authority for the actual
+supported context capacity.
 
 If the native response has no visible content but does contain non-empty
 internal reasoning, the provider uses that field as a last-resort ordinary-text
