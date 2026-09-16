@@ -1465,14 +1465,8 @@ mod tests {
 
     #[test]
     fn system_only_history_without_budget_uses_fallback_user_turn() {
-        let provider = HailoOllamaModelProvider::new(
-            "edge",
-            None,
-            90,
-            5,
-            OllamaTuning::default(),
-        )
-        .expect("typed default Hailo URL must be valid");
+        let provider = HailoOllamaModelProvider::new("edge", None, 90, 5, OllamaTuning::default())
+            .expect("typed default Hailo URL must be valid");
         let messages = provider
             .normalize_messages(vec![Message {
                 role: "system".to_string(),
@@ -1482,11 +1476,16 @@ mod tests {
                 tool_name: None,
             }])
             .expect("zero local context budget must not reject the fallback user turn");
-        assert_eq!(messages.last().map(|message| message.role.as_str()), Some("user"));
-        assert!(messages
-            .last()
-            .and_then(|message| message.content.as_deref())
-            .is_some_and(|content| content.contains("Request: hello")));
+        assert_eq!(
+            messages.last().map(|message| message.role.as_str()),
+            Some("user")
+        );
+        assert!(
+            messages
+                .last()
+                .and_then(|message| message.content.as_deref())
+                .is_some_and(|content| content.contains("Request: hello"))
+        );
     }
 
     #[test]

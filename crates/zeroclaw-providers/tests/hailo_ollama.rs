@@ -1569,7 +1569,10 @@ async fn native_hailo_bounds_history_and_preserves_latest_user_tail() {
     ];
     for index in 0..8 {
         history.push(ChatMessage::user(format!("u{index}{}", "u".repeat(400))));
-        history.push(ChatMessage::assistant(format!("a{index}{}", "a".repeat(400))));
+        history.push(ChatMessage::assistant(format!(
+            "a{index}{}",
+            "a".repeat(400)
+        )));
     }
     history.push(ChatMessage::user(format!(
         "LATEST_HEAD{}LATEST_TAIL",
@@ -1607,10 +1610,12 @@ async fn native_hailo_bounds_history_and_preserves_latest_user_tail() {
             .expect("first content")
             .starts_with("Instructions: ")
     );
-    assert!(!messages[0]["content"]
-        .as_str()
-        .expect("first content")
-        .contains("Request: u0"));
+    assert!(
+        !messages[0]["content"]
+            .as_str()
+            .expect("first content")
+            .contains("Request: u0")
+    );
     assert_eq!(messages.last().expect("latest message")["role"], "user");
     assert!(
         messages.last().expect("latest message")["content"]
