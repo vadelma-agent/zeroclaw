@@ -1445,7 +1445,7 @@ mod tests {
             90,
             5,
             OllamaTuning {
-                num_ctx: 0,
+                num_ctx: 1,
                 num_predict: 0,
                 temperature_override: None,
             },
