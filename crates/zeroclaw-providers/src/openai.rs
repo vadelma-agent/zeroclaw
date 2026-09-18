@@ -1,3 +1,4 @@
+use crate::compatible::{MAX_MODELS_RESPONSE_BYTES, read_body_capped};
 use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
     build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
@@ -1307,7 +1308,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             let status = response.status();
             anyhow::bail!("OpenAI Responses model list failed at {url}: HTTP {status}");
         }
-        let bytes = response.bytes().await?;
+        let bytes = read_body_capped(response, MAX_MODELS_RESPONSE_BYTES).await?;
         crate::compatible::parse_model_ids_from_bytes(&bytes)
     }
 
@@ -1521,6 +1522,86 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiResponsesModelProvider 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn responses_model_listing_parses_normal_body() {
+        use axum::{Json, Router, routing::get};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/models",
+            get(|| async {
+                Json(serde_json::json!({
+                    "data": [{"id": "z-model"}, {"id": "a-model"}]
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Responses model-list test server");
+        let addr = listener
+            .local_addr()
+            .expect("Responses model-list test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Responses model-list test");
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{addr}"))
+            .credential(Some("test-key"))
+            .build();
+        assert_eq!(
+            provider
+                .list_models()
+                .await
+                .expect("normal Responses catalog must parse"),
+            vec!["a-model", "z-model"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_model_listing_bounds_success_body() {
+        use axum::{Router, body::Body, response::Response, routing::get};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/models",
+            get(|| async {
+                Response::builder()
+                    .status(200)
+                    .body(Body::from(vec![
+                        b'x';
+                        (MAX_MODELS_RESPONSE_BYTES as usize) + 1
+                    ]))
+                    .expect("oversized test response")
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Responses model-list test server");
+        let addr = listener
+            .local_addr()
+            .expect("Responses model-list test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Responses model-list test");
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{addr}"))
+            .credential(Some("test-key"))
+            .build();
+        let error = provider
+            .list_models()
+            .await
+            .expect_err("oversized Responses catalog must be rejected");
+        assert!(error.to_string().contains("exceeds"));
+        server.abort();
+    }
 
     #[tokio::test]
     async fn responses_completed_ignores_trailing_events_without_eof() {

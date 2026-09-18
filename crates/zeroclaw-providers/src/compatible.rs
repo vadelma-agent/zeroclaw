@@ -349,14 +349,14 @@ fn streaming_api_error(status: reqwest::StatusCode, body: &str) -> StreamError {
 /// router from making the client buffer an unbounded body — a boundary that
 /// matters most on the public, credential-free listing path a `PUBLIC_MODEL_LISTING`
 /// family (ZeroRouter, Kilo, AtlasCloud) exposes.
-const MAX_MODELS_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_MODELS_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Read a response body into memory, refusing anything past `max_bytes`: a
 /// declared `Content-Length` over the cap fails fast, and a stream that grows
 /// past it fails as the bytes arrive (so a lying or absent `Content-Length`
 /// cannot get around the bound). Mirrors the bounded reader in `zeroclaw-channels`
 /// so both behave identically, without taking a cross-crate dependency for it.
-async fn read_body_capped(
+pub(crate) async fn read_body_capped(
     mut response: reqwest::Response,
     max_bytes: u64,
 ) -> anyhow::Result<Vec<u8>> {
