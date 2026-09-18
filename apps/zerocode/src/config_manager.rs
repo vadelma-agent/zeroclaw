@@ -51,7 +51,7 @@ fn is_direct_child_path(path: &str, prefix: &str) -> bool {
 fn model_field_catalog_reference(path: &str) -> Option<String> {
     let segments: Vec<&str> = path.split('.').collect();
     match segments.as_slice() {
-        ["providers", "models", family, alias, "model", ..]
+        ["providers", "models", family, alias, "model"]
             if !family.is_empty() && !alias.is_empty() =>
         {
             Some(format!("{family}.{alias}"))

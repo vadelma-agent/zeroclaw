@@ -1287,23 +1287,15 @@ impl ModelProvider for OpenAiResponsesModelProvider {
     /// live models instead of an unrelated public list.
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         let url = self.models_url();
-        let response = self
-            .http_client()
-            .get(&url)
-            .header(
-                "Authorization",
-                self.credential
-                    .as_deref()
-                    .map(|credential| format!("Bearer {credential}"))
-                    .unwrap_or_default(),
-            )
-            .send()
-            .await
-            .map_err(|error| {
-                anyhow::Error::msg(format!(
-                    "OpenAI Responses model list request failed: {url}: {error}"
-                ))
-            })?;
+        let mut request = self.http_client().get(&url);
+        if let Some(credential) = self.credential.as_deref() {
+            request = request.header("Authorization", format!("Bearer {credential}"));
+        }
+        let response = request.send().await.map_err(|error| {
+            anyhow::Error::msg(format!(
+                "OpenAI Responses model list request failed: {url}: {error}"
+            ))
+        })?;
         if !response.status().is_success() {
             let status = response.status();
             anyhow::bail!("OpenAI Responses model list failed at {url}: HTTP {status}");
@@ -1558,6 +1550,48 @@ mod tests {
                 .await
                 .expect("normal Responses catalog must parse"),
             vec!["a-model", "z-model"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_model_listing_omits_empty_authorization_header() {
+        use axum::{Json, Router, extract::Request, http::StatusCode, routing::get};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/models",
+            get(|request: Request| async move {
+                if request.headers().get("authorization").is_some() {
+                    Err(StatusCode::BAD_REQUEST)
+                } else {
+                    Ok(Json(serde_json::json!({
+                        "data": [{"id": "unauthenticated-model"}]
+                    })))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Responses model-list test server");
+        let addr = listener
+            .local_addr()
+            .expect("Responses model-list test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Responses model-list test");
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{addr}"))
+            .build();
+        assert_eq!(
+            provider
+                .list_models()
+                .await
+                .expect("unauthenticated Responses catalog must parse"),
+            vec!["unauthenticated-model"]
         );
         server.abort();
     }
