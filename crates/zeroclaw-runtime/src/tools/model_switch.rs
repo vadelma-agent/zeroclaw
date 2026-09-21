@@ -782,12 +782,8 @@ mod tests {
                 Ok(Ok(value)) => {
                     if value
                         .get("zeroclaw")
-                        .and_then(|zc| zc.get("provider"))
+                        .and_then(|zc| zc.get("model_provider"))
                         .is_some()
-                        || value
-                            .get("zeroclaw")
-                            .and_then(|zc| zc.get("provider_type"))
-                            .is_some()
                     {
                         found_attribution = true;
                     }
