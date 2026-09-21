@@ -292,7 +292,9 @@ impl ModelSwitchTool {
             .map_or(provider_ref, |(family, _)| family);
         let provider =
             zeroclaw_providers::create_model_provider_from_ref(&self.config, provider_ref)?;
-        let live_result = provider.list_models().await;
+        let live_result = zeroclaw_providers::ProviderDispatch::from_ref(&*provider)
+            .list_models()
+            .await;
         fallback_if_model_listing_unsupported(live_result, || {
             zeroclaw_providers::catalog::list_models_for_family(family)
         })
@@ -707,6 +709,99 @@ mod tests {
         assert!(result.success, "unexpected error: {:?}", result.error);
         let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(output["models"], json!(["llama-local"]));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn list_models_production_path_opens_provider_attribution_span() {
+        // Regression for the reviewer finding that the production
+        // `resolve_catalog` call bypassed `ProviderDispatch` and its
+        // attribution span. This exercises the real (non-test-resolver)
+        // path against a fake Ollama endpoint and asserts the emitted
+        // event carries the provider attribution block, proving the
+        // production call is routed through `ProviderDispatch::list_models`.
+        use axum::{Json, Router, routing::get};
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+
+        async fn models() -> Json<serde_json::Value> {
+            Json(json!({"data": [{"id": "attributed-model"}]}))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Ollama endpoint");
+        let address = listener.local_addr().expect("fake endpoint address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, Router::new().route("/v1/models", get(models)))
+                .await
+                .expect("serve fake Ollama endpoint");
+        });
+
+        let mut config = Config::default();
+        config.providers.models.ollama.insert(
+            "attributed".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(format!("http://{address}")),
+                    model: Some("attributed-model".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        // No `with_catalog_resolver`: this must go through the production
+        // `resolve_catalog` -> `ProviderDispatch::from_ref(...).list_models()`
+        // call, not the `#[cfg(test)]` resolver shortcut.
+        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let result = tool
+            .handle_list_models(&json!({ "model_provider": "ollama.attributed" }))
+            .await
+            .expect("list_models should return a tool result");
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["models"], json!(["attributed-model"]));
+
+        // The attribution span only opens around the `ProviderDispatch`
+        // wrapper; the raw `provider.list_models()` call this replaces does
+        // not emit it. Finding the span-scoped event proves the production
+        // call site is dispatched through the attribution boundary.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found_attribution = false;
+        while !found_attribution && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("zeroclaw")
+                        .and_then(|zc| zc.get("provider"))
+                        .is_some()
+                        || value
+                            .get("zeroclaw")
+                            .and_then(|zc| zc.get("provider_type"))
+                            .is_some()
+                    {
+                        found_attribution = true;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        assert!(
+            found_attribution,
+            "model_switch list_models production path did not emit a provider attribution span; \
+             it must route through ProviderDispatch::from_ref(...).list_models()"
+        );
 
         server.abort();
     }
