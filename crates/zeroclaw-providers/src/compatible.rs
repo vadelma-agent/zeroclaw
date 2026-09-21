@@ -3259,6 +3259,12 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         if list_credential.is_some() || self.public_model_listing || !self.extra_headers.is_empty()
         {
             let url = self.models_url();
+            // A configured endpoint URL can carry credentials in its userinfo,
+            // query, or fragment. Log and report only the scrubbed form: the
+            // central catalog caller sanitizes the returned error, but these
+            // structured log attributes and error strings are produced before
+            // it and would otherwise leak into operator logs.
+            let safe_url = super::sanitize_api_error(&url);
             let response = self
                 .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())?
                 .send()
@@ -3270,20 +3276,23 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "model_provider": &self.name,
-                                "url": &url,
+                                "url": &safe_url,
                                 "phase": "model_list_request",
                                 "error": super::format_error_chain(&e),
                             })),
                         "compatible: model list request failed"
                     );
                     anyhow::Error::msg(format!(
-                        "{} model list request failed: {url}: {e}",
+                        "{} model list request failed: {safe_url}: {e}",
                         self.name
                     ))
                 })?;
             if !response.status().is_success() {
                 let status = response.status();
-                anyhow::bail!("{} model list failed at {url}: HTTP {status}", self.name);
+                anyhow::bail!(
+                    "{} model list failed at {safe_url}: HTTP {status}",
+                    self.name
+                );
             }
             let raw = read_body_capped(response, MAX_MODELS_RESPONSE_BYTES)
                 .await
@@ -3353,6 +3362,12 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         if list_credential.is_some() || self.public_model_listing || !self.extra_headers.is_empty()
         {
             let url = self.models_url();
+            // A configured endpoint URL can carry credentials in its userinfo,
+            // query, or fragment. Log and report only the scrubbed form: the
+            // central catalog caller sanitizes the returned error, but these
+            // structured log attributes and error strings are produced before
+            // it and would otherwise leak into operator logs.
+            let safe_url = super::sanitize_api_error(&url);
             let response = self
                 .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())?
                 .send()
@@ -3364,20 +3379,23 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "model_provider": &self.name,
-                                "url": &url,
+                                "url": &safe_url,
                                 "phase": "model_list_request",
                                 "error": super::format_error_chain(&e),
                             })),
                         "compatible: model list request failed"
                     );
                     anyhow::Error::msg(format!(
-                        "{} model list request failed: {url}: {e}",
+                        "{} model list request failed: {safe_url}: {e}",
                         self.name
                     ))
                 })?;
             if !response.status().is_success() {
                 let status = response.status();
-                anyhow::bail!("{} model list failed at {url}: HTTP {status}", self.name);
+                anyhow::bail!(
+                    "{} model list failed at {safe_url}: HTTP {status}",
+                    self.name
+                );
             }
             let raw = read_body_capped(response, MAX_MODELS_RESPONSE_BYTES)
                 .await
@@ -12626,5 +12644,51 @@ mod tests {
 
         let _unused: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         server_handle.abort();
+    }
+
+    /// A configured endpoint URL may carry credentials in its userinfo,
+    /// query, or fragment. The header-only probe branch reports transport
+    /// failures before the central catalog caller sanitizes the returned
+    /// error, so the URL it embeds must already be scrubbed.
+    #[tokio::test]
+    async fn list_models_scrubs_url_credentials_from_transport_failure() {
+        // Bind and immediately drop the listener so the port is closed: this
+        // forces a connect-level transport failure (the `map_err` branch that
+        // formats the URL), rather than an HTTP status failure.
+        let closed_addr = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Auth".to_string(), "bridge-token".to_string());
+        let provider = OpenAiCompatibleModelProvider::builder("url-credential")
+            .display_name("url-credential")
+            .base_url(&format!(
+                "http://synthetic-user:synthetic-secret@{}:{}",
+                closed_addr.ip(),
+                closed_addr.port()
+            ))
+            .auth_style(AuthStyle::Bearer)
+            .extra_headers(headers)
+            .build();
+
+        let error = provider
+            .list_models()
+            .await
+            .expect_err("a closed configured endpoint must surface a transport failure");
+        let rendered = format!("{error:#}");
+        assert!(
+            !rendered.contains("synthetic-secret"),
+            "URL userinfo credentials must not reach the returned error: {rendered}"
+        );
+        assert!(
+            !rendered.contains("synthetic-user"),
+            "URL userinfo must not reach the returned error: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "the scrubbed URL should retain a redaction marker: {rendered}"
+        );
     }
 }

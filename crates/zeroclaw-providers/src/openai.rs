@@ -1596,6 +1596,80 @@ mod tests {
         server.abort();
     }
 
+    /// A header-only configured Responses profile (a `Cookie`/`X-Auth`
+    /// bridge rather than a credential resolved into `Authorization`) must
+    /// reach `/models` carrying its configured `extra_headers`, and a real
+    /// authorization failure on that path must stay actionable rather than
+    /// being replaced by unrelated public catalog data.
+    #[tokio::test]
+    async fn responses_model_listing_carries_header_only_profile_and_surfaces_auth_failure() {
+        use axum::{Json, Router, extract::Request, http::StatusCode, routing::get};
+        use tokio::net::TcpListener;
+
+        // Success case: the configured X-Auth header must arrive, and no
+        // Authorization header should be synthesized for a header-only profile.
+        let app = Router::new().route(
+            "/models",
+            get(|request: Request| async move {
+                let headers = request.headers();
+                if headers.get("authorization").is_some() {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                match headers.get("x-auth").and_then(|value| value.to_str().ok()) {
+                    Some("bridge-token") => Ok(Json(serde_json::json!({
+                        "data": [{"id": "header-only-model"}]
+                    }))),
+                    // Without the configured header the endpoint rejects the
+                    // request, which is what the failure case below asserts.
+                    _ => Err(StatusCode::FORBIDDEN),
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind header-only Responses test server");
+        let addr = listener
+            .local_addr()
+            .expect("header-only Responses test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve header-only Responses test");
+        });
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Auth".to_string(), "bridge-token".to_string());
+        let provider = OpenAiResponsesModelProvider::builder("header-only")
+            .api_url(&format!("http://{addr}"))
+            .extra_headers(headers)
+            .build();
+        assert_eq!(
+            provider
+                .list_models()
+                .await
+                .expect("a header-only Responses profile must reach /models with its headers"),
+            vec!["header-only-model"],
+            "the configured extra_headers must be carried into the catalog request"
+        );
+
+        // Failure case: same endpoint, no configured bridge header. The 403
+        // must surface as an actionable error, not an empty/public fallback.
+        let unauthenticated = OpenAiResponsesModelProvider::builder("header-only-missing")
+            .api_url(&format!("http://{addr}"))
+            .build();
+        let error = unauthenticated
+            .list_models()
+            .await
+            .expect_err("a genuine Responses authorization failure must stay actionable");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("403"),
+            "expected the endpoint's real authorization failure, got: {rendered}"
+        );
+
+        server.abort();
+    }
+
     #[tokio::test]
     async fn responses_model_listing_bounds_success_body() {
         use axum::{Router, body::Body, response::Response, routing::get};
