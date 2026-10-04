@@ -3382,15 +3382,32 @@ impl Agent {
     }
 
     fn tool_protocol_prompts(&self) -> Result<Arc<crate::agent::turn::ToolProtocolPrompts>> {
-        Ok(Arc::new(crate::agent::turn::ToolProtocolPrompts::new(
-            self.build_system_prompt_with_dispatcher(&NativeToolDispatcher)?,
-            self.build_system_prompt_with_dispatcher(&XmlToolDispatcher)?,
-        )))
+        Ok(Arc::new(
+            crate::agent::turn::ToolProtocolPrompts::with_max_chars(
+                // The turn may switch transport after construction: keep both
+                // variants complete (0 = no cap, as in `finalize_system_prompt`)
+                // and cap the provider-bound request after the swap.
+                self.build_system_prompt_with_dispatcher_and_cap(&NativeToolDispatcher, 0)?,
+                self.build_system_prompt_with_dispatcher_and_cap(&XmlToolDispatcher, 0)?,
+                self.config.resolved.max_system_prompt_chars,
+            ),
+        ))
     }
 
     fn build_system_prompt_with_dispatcher(
         &self,
         dispatcher: &dyn ToolDispatcher,
+    ) -> Result<String> {
+        self.build_system_prompt_with_dispatcher_and_cap(
+            dispatcher,
+            self.config.resolved.max_system_prompt_chars,
+        )
+    }
+
+    fn build_system_prompt_with_dispatcher_and_cap(
+        &self,
+        dispatcher: &dyn ToolDispatcher,
+        max_chars: usize,
     ) -> Result<String> {
         let expose_text_tool_protocol =
             !self.config.resolved.strict_tool_parsing || dispatcher.should_send_tool_specs();
@@ -3432,7 +3449,6 @@ impl Agent {
         let mut prompt = self
             .prompt_builder
             .build_with_approval_policy(&ctx, &prompt_always_ask)?;
-        append_timestamp_orientation(&mut prompt);
         let receipts = &self.config.resolved.tool_receipts;
         if receipts.enabled && receipts.inject_system_prompt {
             prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
@@ -3455,7 +3471,14 @@ impl Agent {
             prompt.push_str("\n\n");
             prompt.push_str(&pinned_section);
         }
-        Ok(prompt)
+        // Keep the runtime orientation at the end of the complete prompt so
+        // truncation cannot retain an earlier copy and append a second one.
+        append_timestamp_orientation(&mut prompt);
+        // Match the channel/CLI prompt path: cap the fully assembled prompt,
+        // including dispatcher instructions, receipts, and MCP sections.
+        Ok(crate::agent::system_prompt::finalize_system_prompt(
+            prompt, max_chars,
+        ))
     }
 
     fn rebuild_system_prompt_for_dispatcher(
@@ -8743,6 +8766,61 @@ mod tests {
                 prompt.contains("SOUL_MD_CONTROL_9341"),
                 "SOUL.md must still reach the Chat system prompt"
             );
+        }
+
+        #[tokio::test]
+        async fn streamed_agent_caps_fully_assembled_system_prompt_on_every_turn() {
+            let (provider, captured) = capturing_provider(false);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+            agent.config.resolved.compact_context = true;
+            agent.config.resolved.max_system_prompt_chars = 4_000;
+            // MCP/tool guidance is appended after the base identity prompt.
+            // The cap must cover this tail, even when the dispatcher switches
+            // from native to XML tool instructions at the turn boundary.
+            agent.mcp_pinned = vec![zeroclaw_tools::mcp_context::PinnedResourceBlock {
+                key: "docs__large".into(),
+                rendered: format!("<mcp-resource>{}</mcp-resource>", "界".repeat(5_000)),
+            }];
+            let assert_capped = |prompt: &str| {
+                assert_eq!(prompt.chars().count(), 4_000);
+                assert!(prompt.ends_with(crate::agent::prompt::TIMESTAMP_ORIENTATION));
+                assert_eq!(
+                    prompt
+                        .matches(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                        .count(),
+                    1,
+                    "the capped prompt must not repeat the timestamp orientation"
+                );
+                assert!(prompt.contains("## Project Context"));
+            };
+
+            let initial = agent.build_system_prompt().expect("initial prompt");
+            assert_capped(&initial);
+            agent.history = vec![ConversationMessage::Chat(ChatMessage::system(initial))];
+            agent.set_tool_dispatcher(Box::new(XmlToolDispatcher));
+            let ConversationMessage::Chat(rebuilt) = &agent.history[0] else {
+                panic!("rebuilt system prompt must be a chat message");
+            };
+            assert_capped(&rebuilt.content);
+            assert!(rebuilt.content.contains(XML_TOOLS_MARKER));
+
+            for message in ["first", "follow-up"] {
+                let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+                agent
+                    .turn_streamed(message, event_tx, None)
+                    .await
+                    .expect("streamed Agent turn should succeed");
+            }
+            let captured = captured.lock();
+            assert_eq!(captured.len(), 2);
+            for request in captured.iter() {
+                let system = request
+                    .iter()
+                    .find(|message| message.role == "system")
+                    .expect("provider-visible system prompt");
+                assert_capped(&system.content);
+                assert!(system.content.contains(XML_TOOLS_MARKER));
+            }
         }
 
         #[tokio::test]
