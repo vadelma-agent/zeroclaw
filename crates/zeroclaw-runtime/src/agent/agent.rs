@@ -4422,7 +4422,7 @@ impl Agent {
                 new_messages: new_msgs,
             });
         }
-        let tool_protocol_prompts = match self.tool_protocol_prompts() {
+        let mut tool_protocol_prompts = match self.tool_protocol_prompts() {
             Ok(prompts) => prompts,
             Err(error) => {
                 let notice = self.trim_history(Some(&turn_id));
@@ -4907,16 +4907,24 @@ impl Agent {
                             new_model,
                         )
                     {
-                        if let Err(error) = self
+                        // Rebuild the per-turn protocol prompts too: a capped
+                        // native request is built from them, so keeping the
+                        // turn-start pair would send the pre-switch model
+                        // label and workspace instructions.
+                        let refreshed = self
                             .rebuild_streamed_system_prompt_for_active_provider(&mut loop_history)
-                        {
-                            let notice = self.trim_history(Some(&turn_id));
-                            forward_history_trim_notice(&event_tx, notice).await;
-                            return Err(StreamedTurnError {
-                                error,
-                                committed_response,
-                                new_messages: new_msgs,
-                            });
+                            .and_then(|()| self.tool_protocol_prompts());
+                        match refreshed {
+                            Ok(prompts) => tool_protocol_prompts = prompts,
+                            Err(error) => {
+                                let notice = self.trim_history(Some(&turn_id));
+                                forward_history_trim_notice(&event_tx, notice).await;
+                                return Err(StreamedTurnError {
+                                    error,
+                                    committed_response,
+                                    new_messages: new_msgs,
+                                });
+                            }
                         }
                         let notice = self.trim_history(Some(&turn_id));
                         forward_history_trim_notice(&event_tx, notice).await;
@@ -17859,6 +17867,167 @@ model_provider = "custom.only"
              provider/model (ollama/llama3); captured events: {events:?}"
         );
         drop(events);
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_model_switch_refreshes_capped_native_request() {
+        use axum::{Json, Router, response::IntoResponse};
+
+        // The switch target is a native-tool (OpenAI) provider whose requests
+        // are captured, so the post-switch request itself can be inspected.
+        // Every path is served and recorded, so a provider-side URL change
+        // shows up in the failure message instead of a bare 404.
+        let requests: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let seen_by_server = Arc::clone(&seen);
+        let app = Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
+                let captured = Arc::clone(&captured);
+                let seen = Arc::clone(&seen_by_server);
+                async move {
+                    seen.lock().push(format!("{method} {}", uri.path()));
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                    let stream = body["stream"].as_bool().unwrap_or(false);
+                    captured.lock().push(body);
+                    if stream {
+                        let chunk = serde_json::json!({
+                            "choices": [{"delta": {"content": "switched answer"}, "finish_reason": "stop"}]
+                        });
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                        )
+                            .into_response()
+                    } else {
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": {"role": "assistant", "content": "switched answer"},
+                                "finish_reason": "stop"
+                            }]
+                        }))
+                        .into_response()
+                    }
+                }
+            },
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake switched provider");
+        let address = listener.local_addr().expect("fake provider address");
+        zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake switched provider");
+        });
+
+        let mut config = zeroclaw_config::schema::Config {
+            reliability: zeroclaw_config::schema::ReliabilityConfig {
+                provider_retries: 0,
+                provider_backoff_ms: 0,
+                ..zeroclaw_config::schema::ReliabilityConfig::default()
+            },
+            ..zeroclaw_config::schema::Config::default()
+        };
+        {
+            let entry = config
+                .providers
+                .models
+                .ensure("openai", "switched")
+                .expect("openai model_provider type slot");
+            entry.api_key = Some("switched-key".to_string());
+            entry.uri = Some(format!("http://{address}"));
+            entry.model = Some("switched-model".to_string());
+            // Chat Completions keeps the request shape (system message,
+            // native `tools`) straightforward to inspect.
+            entry.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+        }
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(Arc::new(config)),
+            live_config: None,
+            live: None,
+        };
+        // Any cap makes a native request come from the per-turn protocol
+        // prompts rather than from the (rebuilt) history prompt.
+        let cap = 200_000;
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                strict_tool_parsing: true,
+                max_system_prompt_chars: cap,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                .expect("memory creation"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(StreamSwitchTriggerProvider {
+                call_count: Arc::new(Mutex::new(0usize)),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(ModelSwitchTriggerTool {
+                    target_provider: "openai.switched".to_string(),
+                    target_model: "switched-model".to_string(),
+                })],
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .config(agent_config)
+            .workspace_dir(workspace.path().to_path_buf())
+            .model_provider_name("openai".to_string())
+            .model_name("gpt-4o-mini".to_string())
+            .provider_switch_config(switch_cfg)
+            .build()
+            .expect("agent builder");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            agent.turn_streamed("please switch the model", event_tx, None),
+        )
+        .await
+        .expect("streamed turn must not hang");
+        assert!(
+            response.is_ok(),
+            "the switched provider answers the turn: {:?}; requests seen: {:?}",
+            response.err().map(|error| error.to_string()),
+            seen.lock()
+        );
+        assert_eq!(agent.model_name, "switched-model");
+
+        let requests = requests.lock();
+        let request = requests
+            .first()
+            .expect("the switched provider must receive the post-switch request");
+        let system = request["messages"]
+            .as_array()
+            .and_then(|messages| messages.iter().find(|message| message["role"] == "system"))
+            .and_then(|message| message["content"].as_str())
+            .expect("the post-switch request must carry a system prompt");
+        assert!(
+            request.get("tools").is_some(),
+            "the post-switch request must use the native tool protocol"
+        );
+        assert!(
+            system.contains("Model: switched-model"),
+            "the capped native request must be rebuilt for the switched model"
+        );
+        assert!(
+            !system.contains("Model: gpt-4o-mini"),
+            "the capped native request must not reuse the turn-start prompt"
+        );
+        assert!(system.chars().count() <= cap);
     }
 
     fn turn_datetime_agent(
